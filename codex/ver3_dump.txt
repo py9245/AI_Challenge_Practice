@@ -1,0 +1,696 @@
+
+# Cell 2
+import os
+import platform
+import shutil
+import subprocess
+from pathlib import Path
+
+import torch
+
+print(f"Python: {platform.python_version()}")
+print(f"Torch: {torch.__version__}")
+print(f"CUDA devices: {torch.cuda.device_count()}")
+
+if torch.cuda.is_available():
+    for idx in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(idx)
+        print(f"  GPU {idx}: {props.name} ({props.total_memory / 1024 ** 3:.1f} GB)")
+    try:
+        subprocess.run(["nvidia-smi"], check=False)
+    except FileNotFoundError:
+        print("nvidia-smi command not available.")
+else:
+    print("CUDA not available; training will run on CPU.")
+
+project_root = Path(os.environ.get("PROJECT_ROOT", Path.home() / "workspace"))
+project_root.mkdir(parents=True, exist_ok=True)
+print(f"Project root: {project_root.resolve()}")
+
+if project_root.exists():
+    total, used, free = shutil.disk_usage(project_root)
+    print(
+        f"Disk usage for {project_root}: total={total/1e9:.1f} GB | "
+        f"used={used/1e9:.1f} GB | free={free/1e9:.1f} GB"
+    )
+
+# Cell 4
+%%capture
+%pip install --upgrade transformers accelerate einops tiktoken huggingface_hub qwen-vl-utils peft bitsandbytes python-dotenv
+
+# Cell 6
+import json
+import math
+import os
+import random
+import re
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from IPython.display import display
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
+
+import matplotlib.pyplot as plt
+import torch
+from dotenv import load_dotenv
+from huggingface_hub import login
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+plt.rcParams["figure.figsize"] = (6, 6)
+plt.rcParams["axes.grid"] = False
+pd.set_option("display.max_columns", None)
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch.backends.cuda.matmul.allow_tf32 = True
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.home() / "workspace"))
+PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
+
+WORK_DIR = Path(os.environ.get("WORK_DIR", PROJECT_ROOT / "runs"))
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+ARTIFACT_DIR = WORK_DIR / "artifacts"
+ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_KEYWORD = os.environ.get("DATA_KEYWORD", "2025-ssafy-14")
+ENV_DATA_ROOT = os.environ.get("DATA_ROOT")
+ENV_ARCHIVE_PATH = os.environ.get("DATA_ARCHIVE_PATH")
+CUSTOM_SEARCH = os.environ.get("DATA_SEARCH_DIR")
+
+load_dotenv(Path.cwd() / ".env")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    print("[OK] HF_TOKEN loaded from .env/environment.")
+else:
+    print("[WARN] HF_TOKEN not found. Set it in .env for gated Hugging Face models.")
+
+DATA_SEARCH_DIRS = []
+if CUSTOM_SEARCH:
+    DATA_SEARCH_DIRS.append(Path(CUSTOM_SEARCH).expanduser())
+if ENV_DATA_ROOT:
+    DATA_SEARCH_DIRS.append(Path(ENV_DATA_ROOT).expanduser())
+DATA_SEARCH_DIRS.extend(
+    [
+        PROJECT_ROOT,
+        PROJECT_ROOT / "data",
+        Path.home(),
+    ]
+)
+
+unique_dirs = []
+for path in DATA_SEARCH_DIRS:
+    if path is None:
+        continue
+    path = Path(path).expanduser()
+    if path not in unique_dirs:
+        unique_dirs.append(path)
+DATA_SEARCH_DIRS = unique_dirs
+
+# Cell 8
+import zipfile
+
+data_keyword = DATA_KEYWORD
+DEFAULT_DATA_ROOT = PROJECT_ROOT / data_keyword
+DATA_ROOT = None
+
+if ENV_DATA_ROOT:
+    candidate = Path(ENV_DATA_ROOT).expanduser()
+    if (candidate / "train.csv").exists():
+        DATA_ROOT = candidate
+        print(f"Using dataset from DATA_ROOT={DATA_ROOT}")
+
+if DATA_ROOT is None:
+    for base in DATA_SEARCH_DIRS:
+        csv_path = Path(base).expanduser() / data_keyword / "train.csv"
+        if csv_path.exists():
+            DATA_ROOT = csv_path.parent
+            print(f"Detected dataset at {DATA_ROOT}")
+            break
+
+if DATA_ROOT is None:
+    archive_candidates = []
+    if ENV_ARCHIVE_PATH:
+        arch = Path(ENV_ARCHIVE_PATH).expanduser()
+        if arch.exists():
+            archive_candidates.append(arch)
+    for base in DATA_SEARCH_DIRS:
+        base = Path(base).expanduser()
+        candidate = base / f"{data_keyword}.zip"
+        if candidate.exists():
+            archive_candidates.append(candidate)
+    archive_candidates = sorted({p.resolve() for p in archive_candidates})
+    if not archive_candidates:
+        raise FileNotFoundError(
+            "Dataset not found. Set DATA_ROOT or DATA_ARCHIVE_PATH environment variables."
+        )
+    archive_path = archive_candidates[0]
+    DATA_ROOT = DEFAULT_DATA_ROOT
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    print(f"Extracting {archive_path} -> {DATA_ROOT}")
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        zf.extractall(DATA_ROOT)
+else:
+    archive_path = None
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
+print(f"DATA_ROOT resolved to: {DATA_ROOT.resolve()}")
+print("Contents:")
+for child in sorted(DATA_ROOT.iterdir()):
+    print(f"- {child.name}")
+
+# Cell 10
+train_df = pd.read_csv(DATA_ROOT / "train.csv")
+test_df = pd.read_csv(DATA_ROOT / "test.csv")
+sample_submission = pd.read_csv(DATA_ROOT / "sample_submission.csv")
+
+train_df["answer"] = train_df["answer"].str.lower()
+train_df["image_path"] = train_df["path"].apply(lambda p: str((DATA_ROOT / p).resolve()))
+test_df["image_path"] = test_df["path"].apply(lambda p: str((DATA_ROOT / p).resolve()))
+
+print(f"Train shape: {train_df.shape}")
+print(f"Test shape: {test_df.shape}")
+print(f"Sample submission shape: {sample_submission.shape}")
+
+display(train_df.head())
+
+# Cell 12
+label_distribution = train_df["answer"].value_counts().sort_index()
+print("Label distribution (train):")
+display(label_distribution.to_frame(name="count"))
+
+duplicate_ids = train_df["id"].duplicated().sum()
+print(f"Duplicate train IDs: {duplicate_ids}")
+
+null_summary = train_df.isna().sum()
+print("Null counts (train):")
+display(null_summary[null_summary > 0])
+
+sample_paths = train_df["image_path"].sample(n=min(256, len(train_df)), random_state=SEED)
+widths, heights = [], []
+for path in sample_paths:
+    with Image.open(path) as img:
+        w, h = img.size
+    widths.append(w)
+    heights.append(h)
+
+print(
+    f"Sample width px -> mean: {np.mean(widths):.1f}, min: {min(widths)}, max: {max(widths)}"
+)
+print(
+    f"Sample height px -> mean: {np.mean(heights):.1f}, min: {min(heights)}, max: {max(heights)}"
+)
+
+# Cell 14
+num_examples = 4
+fig, axes = plt.subplots(1, num_examples, figsize=(4 * num_examples, 4))
+for ax, (_, row) in zip(axes, train_df.sample(num_examples, random_state=SEED).iterrows()):
+    with Image.open(row["image_path"]) as img:
+        ax.imshow(img)
+    ax.axis("off")
+    title_lines = [
+        row["id"],
+        row["question"][:40] + ("..." if len(row["question"]) > 40 else ""),
+        f"Answer: {row['answer'].upper()}"
+    ]
+    ax.set_title("".join(title_lines), fontsize=9)
+plt.tight_layout()
+
+sample_row = train_df.sample(1, random_state=SEED).iloc[0]
+print("Sample question:", sample_row["question"])
+for key in ["a", "b", "c", "d"]:
+    print(f"{key.upper()}: {sample_row[key]}")
+
+# Cell 16
+train_split, val_split = train_test_split(
+    train_df,
+    test_size=0.1,
+    stratify=train_df["answer"],
+    random_state=SEED,
+)
+
+train_split = train_split.reset_index(drop=True)
+val_split = val_split.reset_index(drop=True)
+
+print(f"Training rows: {len(train_split)}")
+print(f"Validation rows: {len(val_split)}")
+print("Validation label balance:")
+display(val_split["answer"].value_counts().sort_index())
+
+# Cell 18
+SYSTEM_PROMPT = (
+    "You are a Korean visual question answering assistant. "
+    "Inspect the provided image carefully and choose the correct option among a, b, c, d. "
+    "Respond strictly using a JSON object like {\"answer\": \"a\"}. No explanations, no additional text."
+)
+
+CHOICE_KEYS = ["a", "b", "c", "d"]
+
+def create_user_block(row):
+    option_lines = "".join(f"{key.upper()}. {row[key]}" for key in CHOICE_KEYS)
+    return (f"질문:{row['question']}"f"선택지:{option_lines}"
+        "응답 형식: JSON 예시 {\"answer\": \"a\"} (소문자, 따옴표 유지, 설명 금지)."
+    )
+
+def build_messages(row):
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": create_user_block(row)},
+            ],
+        },
+    ]
+
+
+def load_image(path: str) -> Image.Image:
+    with Image.open(path) as img:
+        return img.convert("RGB")
+
+print("Prompt helpers ready.")
+
+# Cell 20
+import importlib.util
+import torch
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+
+if HF_TOKEN:
+    try:
+        login(token=HF_TOKEN, add_to_git_credential=False)
+    except Exception as exc:
+        print(f"[WARN] Hugging Face login skipped: {exc}")
+else:
+    print("[WARN] Proceeding without HF login; ensure the model is accessible for your account.")
+
+processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=compute_dtype,
+)
+
+model = AutoModelForVision2Seq.from_pretrained(
+    MODEL_ID,
+    device_map="auto",
+    trust_remote_code=True,
+    quantization_config=bnb_config,
+)
+
+model = prepare_model_for_kbit_training(model)
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()
+
+target_candidate_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "up_proj",
+    "down_proj",
+    "gate_proj",
+]
+found_modules = set()
+for name, module in model.named_modules():
+    if isinstance(module, torch.nn.Linear) and any(token in name for token in target_candidate_modules):
+        found_modules.add(name.split(".")[-1])
+if not found_modules:
+    found_modules = {"q_proj", "k_proj", "v_proj", "o_proj"}
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=sorted(found_modules),
+)
+
+model = get_peft_model(model, lora_config)
+model.config.use_cache = False
+
+if model.generation_config.pad_token_id is None and hasattr(processor, "tokenizer"):
+    model.generation_config.pad_token_id = processor.tokenizer.pad_token_id
+if model.generation_config.eos_token_id is None and hasattr(processor, "tokenizer"):
+    model.generation_config.eos_token_id = processor.tokenizer.eos_token_id
+
+if hasattr(processor, "tokenizer"):
+    processor.tokenizer.padding_side = "right"
+
+print("Model loaded with 4-bit quantization and LoRA adapters. Trainable parameters:")
+model.print_trainable_parameters()
+
+# Cell 22
+from torch.utils.data import Dataset
+import json
+import torch
+
+MAX_SEQUENCE_LENGTH = 1024
+
+class VqaFineTuneDataset(Dataset):
+    def __init__(self, dataframe):
+        self.df = dataframe.reset_index(drop=True)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        return {
+            "image_path": row["image_path"],
+            "messages": build_messages(row),
+            "answer": str(row["answer"]).lower(),
+        }
+
+def _build_conversation(sample):
+    # 정답 JSON까지 포함한 대화(학습 타깃)
+    conversation = sample["messages"] + [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": json.dumps({"answer": sample["answer"]})}],
+        }
+    ]
+    # (1) 프롬프트만
+    prompt_text = processor.apply_chat_template(
+        sample["messages"], tokenize=False, add_generation_prompt=True
+    )
+    # (2) 프롬프트 + 정답JSON
+    chat_text = processor.apply_chat_template(
+        conversation, tokenize=False, add_generation_prompt=False
+    )
+    return prompt_text, chat_text, sample["image_path"]
+
+# ★ 디코더 전용 모델은 left padding 필수
+if hasattr(processor, "tokenizer"):
+    processor.tokenizer.padding_side = "left"
+
+def fine_tune_collate_fn(batch):
+    images, prompts, full_texts = [], [], []
+
+    for sample in batch:
+        prompt_text, chat_text, image_path = _build_conversation(sample)
+        images.append(load_image(image_path))
+        prompts.append(prompt_text)
+        full_texts.append(chat_text)
+
+    # 🔹 프롬프트를 "이미지 포함"으로 인코딩 → 실제 프롬프트 길이(비전 토큰 포함) 획득
+    enc_prompt = processor(
+        images=images,
+        text=prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_SEQUENCE_LENGTH,
+    )
+    # 🔹 프롬프트+정답 전체 인코딩
+    enc_full = processor(
+        images=images,
+        text=full_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_SEQUENCE_LENGTH,
+    )
+
+    labels = enc_full["input_ids"].clone()
+    # 패딩 토큰은 손실에서 제외
+    labels[enc_full["attention_mask"] == 0] = -100
+
+    # ✅ 패딩 방식과 무관하게 "프롬프트 구간"만 정확히 마스킹
+    for i in range(labels.size(0)):
+        full_mask   = enc_full["attention_mask"][i].bool()          # 전체에서 non-pad 위치
+        prompt_len  = int(enc_prompt["attention_mask"][i].sum().item())  # 프롬프트의 non-pad 길이
+        nonpad_idx  = torch.nonzero(full_mask, as_tuple=False).squeeze(-1)
+        prompt_idx  = nonpad_idx[:prompt_len]   # non-pad 중 앞쪽 prompt_len개가 '프롬프트 토큰'
+        labels[i, prompt_idx] = -100            # 프롬프트 구간 손실 제외
+
+    enc_full["labels"] = labels
+    return enc_full
+
+train_dataset = VqaFineTuneDataset(train_split)
+if len(val_split) <= 128:
+    val_eval_df = val_split.copy().reset_index(drop=True)
+else:
+    val_eval_df = val_split.sample(n=128, random_state=SEED).reset_index(drop=True)
+val_dataset = VqaFineTuneDataset(val_eval_df)
+print(f"Train dataset size: {len(train_dataset)} | Eval dataset size: {len(val_dataset)}")
+
+# Cell 24
+# 12단계: TrainingArguments 하이퍼파라미터 조정 + Trainer 실행 (성능/안정성 우선)
+import inspect
+from transformers import TrainingArguments, Trainer
+
+if hasattr(processor, "tokenizer"):
+    processor.tokenizer.padding_side = "left"
+
+OUTPUT_DIR = WORK_DIR / "qwen25vl_lora"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+GPU_MEM_GB = 0.0
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    GPU_MEM_GB = props.total_memory / 1024 ** 3
+
+PER_DEVICE_BATCH = 2 if GPU_MEM_GB >= 22 else 1
+TARGET_EFFECTIVE_BATCH = int(os.environ.get("EFFECTIVE_BATCH_SIZE", 16))
+GRADIENT_ACCUMULATION = max(1, TARGET_EFFECTIVE_BATCH // PER_DEVICE_BATCH)
+EPOCHS = int(os.environ.get("NUM_EPOCHS", 3))
+LEARNING_RATE = float(os.environ.get("LEARNING_RATE", 5e-5))
+WARMUP_RATIO = float(os.environ.get("WARMUP_RATIO", 0.05))
+
+print(
+    f"GPU memory: {GPU_MEM_GB:.1f} GB | per_device_batch={PER_DEVICE_BATCH} | "
+    f"grad_accum={GRADIENT_ACCUMULATION} | epochs={EPOCHS}"
+)
+
+bf16_enabled = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+common_kwargs = dict(
+    output_dir=str(OUTPUT_DIR),
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=PER_DEVICE_BATCH,
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION,
+    learning_rate=LEARNING_RATE,
+    warmup_ratio=WARMUP_RATIO,
+    lr_scheduler_type="cosine",
+    logging_steps=10,
+    save_strategy="epoch",
+    save_total_limit=3,
+    report_to="none",
+    bf16=bf16_enabled,
+    fp16=not bf16_enabled,
+    optim="adamw_bnb_8bit",
+    dataloader_num_workers=2,
+    gradient_checkpointing=True,
+    max_grad_norm=0.3,
+    remove_unused_columns=False,
+)
+
+max_steps_env = os.environ.get("MAX_TRAIN_STEPS")
+if max_steps_env:
+    common_kwargs["max_steps"] = int(max_steps_env)
+
+sig = inspect.signature(TrainingArguments.__init__)
+if "evaluation_strategy" in sig.parameters:
+    common_kwargs["evaluation_strategy"] = "epoch"
+elif "eval_strategy" in sig.parameters:
+    common_kwargs["eval_strategy"] = "epoch"
+
+training_args = TrainingArguments(**common_kwargs)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=fine_tune_collate_fn,
+)
+
+train_result = trainer.train()
+print("Training metrics:", getattr(train_result, "metrics", {}))
+
+try:
+    eval_metrics = trainer.evaluate(eval_dataset=val_dataset)
+    print("Eval metrics:", eval_metrics)
+except Exception as e:
+    print(f"(info) Evaluation skipped due to: {e}")
+
+adapter_path = OUTPUT_DIR / "lora_adapter"
+model.save_pretrained(adapter_path)
+processor.save_pretrained(OUTPUT_DIR / "processor")
+print(f"LoRA fine-tuning complete. Adapter weights saved to {adapter_path}")
+
+# Cell 26
+LETTER_JSON_PATTERN = re.compile(r'"answer"\s*:\s*"([abcd])"')
+LETTER_FALLBACK_PATTERN = re.compile(r"([abcd])")
+
+PRED_BATCH_SIZE = 2
+MAX_NEW_TOKENS = 24
+
+def decode_answer_text(text: str) -> str:
+    lowered = text.lower()
+    match = LETTER_JSON_PATTERN.search(lowered)
+    if match:
+        return match.group(1)
+    match = LETTER_FALLBACK_PATTERN.search(lowered)
+    if match:
+        return match.group(1)
+    return "a"
+
+
+def run_inference(records, batch_size: int = PRED_BATCH_SIZE, keep_raw: bool = False):
+    outputs = []
+    raw_outputs = [] if keep_raw else None
+    for start in tqdm(range(0, len(records), batch_size)):
+        batch = records[start : start + batch_size]
+        prompts = []
+        images = []
+        for row in batch:
+            prompts.append(
+                processor.apply_chat_template(
+                    build_messages(row),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+            images.append(load_image(row["image_path"]))
+        inputs = processor(
+            text=prompts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        ).to(model.device)
+        with torch.inference_mode():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=0.0,
+                do_sample=False,
+            )
+        decoded = processor.batch_decode(generated, skip_special_tokens=True)
+        for response in decoded:
+            answer = decode_answer_text(response)
+            outputs.append(answer)
+            if keep_raw:
+                raw_outputs.append(response)
+    if keep_raw:
+        return outputs, raw_outputs
+    return outputs
+
+print("Inference helpers initialised.")
+
+# Cell 28
+# 12. Validation Run (OOM-safe, Kaggle T4 대응)
+import gc
+from tqdm.auto import tqdm
+import torch
+
+# Qwen2.5-VL 은 decoder-only 구조 → 반드시 left padding
+if hasattr(processor, "tokenizer"):
+    processor.tokenizer.padding_side = "left"
+
+# 너무 크게 돌리면 T4(16GB)에서 바로 죽음 → 샘플 수 줄이고, 배치=1로 순차 처리
+VALIDATION_LIMIT = min(32, len(val_split))  # 기존 128 -> 32 (필요시 16/24로 더 줄여도 됨)
+validation_subset = val_split.sample(VALIDATION_LIMIT, random_state=SEED).reset_index(drop=True)
+validation_records = validation_subset.to_dict("records")
+
+val_preds, raw_responses = [], []
+
+def _infer_one(row):
+    # 이미지/프롬프트 준비
+    img_path = row["image_path"] if "image_path" in row else row["image"]  # 노트북 컬럼명에 맞춰 자동 대응
+    image = load_image(img_path)
+    messages = build_messages(row)
+    chat_text = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False
+    )
+    # 토크나이저+이미지 인코딩 (배치=1)
+    inputs = processor(
+        images=[image],
+        text=[chat_text],
+        return_tensors="pt",
+        padding=True,
+    ).to(model.device)
+
+    # 실제 생성: 배치=1, no temperature, 짧게, use_cache=False 로 VRAM 절감
+    with torch.inference_mode():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=8,        # 너무 길면 메모리 팍 늘어남
+            do_sample=False,         # temperature 사용 안 함 (경고 제거)
+            use_cache=False          # 캐시 끄면 느리지만 VRAM 사용량↓
+        )
+    text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+
+    # 정리
+    del inputs, output_ids, image
+    gc.collect(); torch.cuda.empty_cache()
+    return text
+
+for row in tqdm(validation_records, total=len(validation_records)):
+    out_text = _infer_one(row)
+    raw_responses.append(out_text)
+
+    # JSON 파싱 (당신 노트북의 파서 함수명이 다르면 바꿔주세요)
+    # 예: pred = parse_json_answer(out_text, choice_keys=CHOICE_KEYS, default="a")
+    try:
+        m = re.search(r'{"\s*answer"\s*:\s*"(a|b|c|d)"}', out_text.strip(), flags=re.I)
+        pred = m.group(1).lower() if m else "a"
+    except Exception:
+        pred = "a"
+    val_preds.append(pred)
+
+validation_subset = validation_subset.copy()
+validation_subset["prediction"] = val_preds
+validation_subset["raw_response"] = raw_responses
+validation_subset["is_correct"] = (validation_subset["answer"].str.lower() == validation_subset["prediction"])
+
+val_accuracy = validation_subset["is_correct"].mean()
+print(f"✅ Validation accuracy on {len(validation_subset)} samples: {val_accuracy:.4f}")
+
+display(validation_subset.head())
+display(
+    validation_subset[validation_subset["is_correct"] == False][
+        ["id", "answer", "prediction", "raw_response"]
+    ].head()
+)
+
+# Cell 30
+test_records = test_df.to_dict("records")
+
+test_predictions = run_inference(test_records)
+submission = pd.DataFrame({
+    "id": test_df["id"],
+    "answer": test_predictions,
+})
+
+submission_path = WORK_DIR / "submission.csv"
+submission.to_csv(submission_path, index=False)
+print(f"Saved submission to {submission_path}")
+
+display(submission.head())
